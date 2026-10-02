@@ -23,7 +23,7 @@ app.set("trust proxy", 1);
 app.use(helmet());
 
 // Parse JSON request bodies
-app.use(express.json({ limit: "100kb" }));
+app.use(express.json({ limit: "1mb" }));
 
 // Only let our own frontend call this API from a browser.
 const allowed = (process.env.CORS_ORIGIN || "").split(",").map((s) => s.trim()).filter(Boolean);

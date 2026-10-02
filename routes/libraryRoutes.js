@@ -55,6 +55,21 @@ async function ownsPlaylist(userId, playlistId) {
   return rows.length > 0;
 }
 
+// Keep only the newest HISTORY_LIMIT plays. (The "keep" wrapper is required
+// because MySQL won't delete from a table it is also selecting from.)
+async function trimHistory(db, userId) {
+  await db.query(
+    `DELETE FROM history
+     WHERE user_id = ? AND track_id NOT IN (
+       SELECT track_id FROM (
+         SELECT track_id FROM history WHERE user_id = ?
+         ORDER BY played_at DESC LIMIT ${HISTORY_LIMIT}
+       ) AS keep
+     )`,
+    [userId, userId]
+  );
+}
+
 // ---------- everything at once ----------
 
 // GET /me/sync -> { favorites, playlists, history }
@@ -118,18 +133,7 @@ router.post("/history", wrap(async (req, res) => {
      ON DUPLICATE KEY UPDATE played_at = CURRENT_TIMESTAMP(3), track = ?`,
     [req.userId, track.id, json, json]
   );
-  // Keep only the newest HISTORY_LIMIT rows (the "keep" wrapper is required
-  // because MySQL won't delete from a table it is also selecting from).
-  await pool.execute(
-    `DELETE FROM history
-     WHERE user_id = ? AND track_id NOT IN (
-       SELECT track_id FROM (
-         SELECT track_id FROM history WHERE user_id = ?
-         ORDER BY played_at DESC LIMIT ${HISTORY_LIMIT}
-       ) AS keep
-     )`,
-    [req.userId, req.userId]
-  );
+  await trimHistory(pool, req.userId);
   res.status(204).end();
 }));
 
@@ -221,6 +225,77 @@ router.delete("/playlists/:id/tracks/:trackId", wrap(async (req, res) => {
     [req.params.id, req.params.trackId]
   );
   res.status(204).end();
+}));
+
+// ---------- one-time import ----------
+
+const MAX_IMPORT = 500;
+
+// POST /me/sync/import  { favorites, playlists, history }
+// Merges what was saved in the browser before the user logged in.
+// Safe to repeat: anything already on the server is left alone.
+router.post("/sync/import", wrap(async (req, res) => {
+  const body = req.body || {};
+  const lists = [body.favorites ?? [], body.playlists ?? [], body.history ?? []];
+  if (!lists.every(Array.isArray)) return res.status(400).json({ error: "Invalid data." });
+  const [favorites, playlists, history] = lists.map((l) => l.slice(0, MAX_IMPORT));
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction(); // all of it succeeds, or none of it does
+
+    // Browser lists are newest-first. Item k is stamped k seconds in the past
+    // so the original order survives.
+    const favs = favorites.map(cleanTrack).filter(Boolean);
+    for (let k = 0; k < favs.length; k++) {
+      await conn.query(
+        `INSERT INTO favorites (user_id, track_id, track, created_at)
+         VALUES (?, ?, ?, DATE_SUB(CURRENT_TIMESTAMP(3), INTERVAL ? SECOND))
+         ON DUPLICATE KEY UPDATE track_id = track_id`,
+        [req.userId, favs[k].id, JSON.stringify(favs[k]), k]
+      );
+    }
+
+    const plays = history.map(cleanTrack).filter(Boolean);
+    for (let k = 0; k < plays.length; k++) {
+      await conn.query(
+        `INSERT INTO history (user_id, track_id, track, played_at)
+         VALUES (?, ?, ?, DATE_SUB(CURRENT_TIMESTAMP(3), INTERVAL ? SECOND))
+         ON DUPLICATE KEY UPDATE track_id = track_id`,
+        [req.userId, plays[k].id, JSON.stringify(plays[k]), k]
+      );
+    }
+    await trimHistory(conn, req.userId);
+
+    for (const p of playlists.slice(0, MAX_PLAYLISTS)) {
+      const id = cleanId(p?.id);
+      const name = cleanName(p?.name);
+      if (!id || !name) continue;
+      await conn.query(
+        "INSERT INTO playlists (id, user_id, name) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE id = id",
+        [id, req.userId, name]
+      );
+      const [own] = await conn.query("SELECT 1 FROM playlists WHERE id = ? AND user_id = ?", [id, req.userId]);
+      if (!own.length) continue; // that id belongs to someone else: skip it
+      const tracks = (Array.isArray(p.tracks) ? p.tracks : [])
+        .slice(0, MAX_PLAYLIST_TRACKS).map(cleanTrack).filter(Boolean);
+      for (const t of tracks) {
+        await conn.query(
+          `INSERT INTO playlist_tracks (playlist_id, track_id, track) VALUES (?, ?, ?)
+           ON DUPLICATE KEY UPDATE track_id = track_id`,
+          [id, t.id, JSON.stringify(t)]
+        );
+      }
+    }
+
+    await conn.commit();
+    res.status(204).end();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
 }));
 
 export default router;
